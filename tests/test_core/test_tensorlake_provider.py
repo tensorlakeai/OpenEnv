@@ -38,6 +38,7 @@ def fake_sdk():
     sandbox_mod.SandboxNotFoundError = type(
         "SandboxNotFoundError", (sandbox_mod.SandboxError,), {}
     )
+    sandbox_mod.SandboxClient = MagicMock()
     sandbox_mod.Sandbox.create.return_value = _make_sandbox()
     sandbox_mod.sandbox_url_from_ingress_endpoint = lambda endpoint, sandbox_id, port: (
         f"https://{port}-{sandbox_id}.sandbox.tensorlake.ai"
@@ -59,6 +60,7 @@ def test_start_container_launches_server_and_returns_public_url(fake_sdk):
     assert create_kwargs["image"] == "echo-env"
     assert create_kwargs["api_key"] == "key"
     assert create_kwargs["cpus"] == 2
+    assert create_kwargs["timeout_secs"] == 3600
     sandbox = fake_sdk.create.return_value
     cmd, args = sandbox.start_process.call_args.args
     assert cmd == "sh"
@@ -127,8 +129,8 @@ def test_stop_container_terminates_once(fake_sdk):
     sandbox.terminate.assert_called_once()
 
 
-def test_failed_stop_is_retried_through_a_new_connection(fake_sdk):
-    # The real Sandbox.terminate() is one-shot, so a retry must reconnect by ID.
+def test_failed_stop_is_retried_by_id(fake_sdk):
+    # The real Sandbox.terminate() is one-shot, so a retry must delete by ID.
     provider = TensorlakeProvider(image="echo-env", api_key="key")
     provider.start_container()
     sandbox = fake_sdk.create.return_value
@@ -144,8 +146,9 @@ def test_failed_stop_is_retried_through_a_new_connection(fake_sdk):
     provider.stop_container()
 
     sandbox.terminate.assert_called_once()
-    fake_sdk.connect.assert_called_once_with("sbx-1", api_key="key")
-    fake_sdk.connect.return_value.terminate.assert_called_once()
+    client = sys.modules["tensorlake.sandbox"].SandboxClient
+    client.assert_called_once_with(api_key="key")
+    client.return_value.delete.assert_called_once_with("sbx-1")
 
 
 def test_retry_after_sandbox_is_gone_succeeds(fake_sdk):
@@ -154,13 +157,46 @@ def test_retry_after_sandbox_is_gone_succeeds(fake_sdk):
     fake_sdk.create.return_value.terminate.side_effect = ConnectionError("network")
     with pytest.raises(ConnectionError):
         provider.stop_container()
-    fake_sdk.connect.side_effect = sys.modules[
+    sdk = sys.modules["tensorlake.sandbox"]
+    sdk.SandboxClient.return_value.delete.side_effect = sdk.SandboxNotFoundError
+
+    provider.stop_container()
+
+    assert provider.start_container().startswith("https://")
+
+
+def test_stop_on_expired_sandbox_succeeds(fake_sdk):
+    provider = TensorlakeProvider(image="echo-env")
+    provider.start_container()
+    fake_sdk.create.return_value.terminate.side_effect = sys.modules[
         "tensorlake.sandbox"
     ].SandboxNotFoundError
 
     provider.stop_container()
 
     assert provider.start_container().startswith("https://")
+
+
+def test_constructor_env_vars_merge_with_call_env_vars(fake_sdk):
+    provider = TensorlakeProvider(image="echo-env", env_vars={"TOKEN": "t", "A": "1"})
+
+    provider.start_container(env_vars={"A": "2"})
+
+    sandbox = fake_sdk.create.return_value
+    assert sandbox.start_process.call_args.kwargs["env"] == {"TOKEN": "t", "A": "2"}
+
+
+def test_rejects_non_https_url(fake_sdk):
+    sys.modules["tensorlake.sandbox"].sandbox_url_from_ingress_endpoint = (
+        lambda endpoint, sandbox_id, port: "http://insecure"
+    )
+    provider = TensorlakeProvider(image="echo-env")
+
+    with pytest.raises(RuntimeError, match="non-HTTPS") as exc:
+        provider.start_container()
+
+    assert "insecure" not in str(exc.value)
+    fake_sdk.create.return_value.terminate.assert_called_once()
 
 
 def test_second_start_is_rejected(fake_sdk):
@@ -226,3 +262,17 @@ def test_wait_for_ready_survives_temporary_sdk_error(fake_sdk):
         provider.wait_for_ready(url, timeout_s=5)
 
     assert sandbox.get_process.call_count == 2
+
+
+def test_dead_server_message_survives_output_error(fake_sdk):
+    import requests
+
+    provider = TensorlakeProvider(image="echo-env", surface_server_logs=True)
+    url = provider.start_container()
+    sandbox = fake_sdk.create.return_value
+    sandbox.get_process.return_value.status = "exited"
+    sandbox.get_output.side_effect = sys.modules["tensorlake.sandbox"].SandboxError
+
+    with patch("requests.get", side_effect=requests.ConnectionError):
+        with pytest.raises(RuntimeError, match="exited"):
+            provider.wait_for_ready(url, timeout_s=5)

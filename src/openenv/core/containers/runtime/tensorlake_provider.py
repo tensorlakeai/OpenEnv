@@ -12,6 +12,7 @@ import logging
 import os
 import shlex
 import time
+import warnings
 from typing import Any, Dict, Optional
 
 from ._server_config import parse_openenv_app_field
@@ -21,6 +22,23 @@ logger = logging.getLogger(__name__)
 
 _PORT = 8000
 _OPENENV_YAML = "/app/env/openenv.yaml"
+# Bound the sandbox lifetime (RFC 002 S6). Same default as NovitaProvider.
+_DEFAULT_TIMEOUT_SECS = 3600
+_MAX_LOG_CHARS = 2000
+
+
+def _require_secure_url(url: str) -> str:
+    """Enforce https/wss transport (RFC 002 security invariant S1).
+
+    The URL is omitted from the error because an anonymous ingress URL is a
+    bearer capability that must not leak into logs.
+    """
+    if not url.lower().startswith("https://"):
+        raise RuntimeError(
+            "Tensorlake returned a non-HTTPS sandbox URL. OpenEnv requires an "
+            "https/wss base_url so EnvClient traffic is encrypted."
+        )
+    return url
 
 
 class TensorlakeProvider(ContainerProvider):
@@ -50,7 +68,7 @@ class TensorlakeProvider(ContainerProvider):
         api_key: Optional[str] = None,
         cpus: Optional[float] = None,
         memory_mb: Optional[int] = None,
-        timeout_secs: Optional[int] = None,
+        timeout_secs: int = _DEFAULT_TIMEOUT_SECS,
         cmd: Optional[str] = None,
         surface_server_logs: bool = False,
     ):
@@ -60,8 +78,8 @@ class TensorlakeProvider(ContainerProvider):
                 Registered Tensorlake sandbox image name to use when
                 `start_container()` is called without an image.
             env_vars (`dict`, *optional*):
-                Environment variables for the server process when
-                `start_container()` is called without `env_vars`.
+                Environment variables for the server process. Merged with the
+                `env_vars` given to `start_container()`, which take precedence.
             api_key (`str`, *optional*):
                 Tensorlake API key. Falls back to the `TENSORLAKE_API_KEY`
                 environment variable.
@@ -69,8 +87,8 @@ class TensorlakeProvider(ContainerProvider):
                 CPUs for the sandbox. If `None`, Tensorlake chooses.
             memory_mb (`int`, *optional*):
                 Memory for the sandbox in MB. If `None`, Tensorlake chooses.
-            timeout_secs (`int`, *optional*):
-                Sandbox lifetime in seconds. If `None`, Tensorlake chooses.
+            timeout_secs (`int`, *optional*, defaults to `3600`):
+                Sandbox lifetime in seconds.
             cmd (`str`, *optional*):
                 Shell command that starts the server on port 8000. If `None`,
                 the command is built from the `app` field of
@@ -111,7 +129,8 @@ class TensorlakeProvider(ContainerProvider):
             port (`int`, *optional*):
                 Must be `None` or `8000`.
             env_vars (`dict`, *optional*):
-                Environment variables for the server process.
+                Environment variables for the server process. Merged over the
+                constructor `env_vars`.
             **kwargs:
                 `cmd` (`str`) overrides the server command.
 
@@ -135,7 +154,8 @@ class TensorlakeProvider(ContainerProvider):
                 "TensorlakeProvider requires an image. Pass it to the constructor "
                 "or start_container()."
             )
-        effective_env_vars = self._env_vars if env_vars is None else env_vars
+        # AutoEnv always passes env_vars={}, so merge instead of replace.
+        effective_env_vars = {**(self._env_vars or {}), **(env_vars or {})}
         cmd = kwargs.pop("cmd", None) or self._cmd
         # AutoEnv always forwards wait_timeout; it does not apply here.
         kwargs.pop("wait_timeout", None)
@@ -152,7 +172,6 @@ class TensorlakeProvider(ContainerProvider):
                 "Install it with: pip install openenv[tensorlake]"
             ) from exc
 
-        self._secret_values = [v for v in (effective_env_vars or {}).values() if v]
         self._sandbox = Sandbox.create(
             image=effective_image,
             cpus=self._cpus,
@@ -160,6 +179,7 @@ class TensorlakeProvider(ContainerProvider):
             timeout_secs=self._timeout_secs,
             api_key=self._api_key,
         )
+        self._secret_values = [v for v in effective_env_vars.values() if v]
         try:
             self._sandbox_id = self._sandbox.sandbox_id
             if cmd is None:
@@ -174,8 +194,10 @@ class TensorlakeProvider(ContainerProvider):
             )
             if not info.ingress_endpoint:
                 raise RuntimeError("Tensorlake did not return an ingress endpoint.")
-            return sandbox_url_from_ingress_endpoint(
-                info.ingress_endpoint, info.sandbox_id, _PORT
+            return _require_secure_url(
+                sandbox_url_from_ingress_endpoint(
+                    info.ingress_endpoint, info.sandbox_id, _PORT
+                )
             )
         except Exception:
             # Do not let a cleanup failure hide the original error.
@@ -216,31 +238,49 @@ class TensorlakeProvider(ContainerProvider):
                 "Server process exited. Output is withheld to avoid leaking "
                 "secrets. Pass surface_server_logs=True to include it."
             )
-        log = "\n".join(self._sandbox.get_output(self._pid).lines[-50:])
+        from tensorlake.sandbox import SandboxError
+
+        try:
+            log = "\n".join(self._sandbox.get_output(self._pid).lines[-50:])
+        except SandboxError:
+            return "Server process exited. Could not read its output."
         for value in self._secret_values:
             log = log.replace(value, "***")
+        if len(log) > _MAX_LOG_CHARS:
+            log = "...(truncated)...\n" + log[-_MAX_LOG_CHARS:]
         return f"Server process exited.\nLog (redacted, best-effort):\n{log}"
 
     def stop_container(self) -> None:
         """
         Terminate the Tensorlake sandbox.
 
-        If termination fails, the sandbox ID is kept. The next call connects
-        to the sandbox again by ID and tries again.
+        If termination fails, the sandbox ID is kept. The next call deletes
+        the sandbox by ID. A sandbox that is already gone counts as stopped.
         """
-        if self._sandbox is not None:
-            sandbox, self._sandbox, self._pid = self._sandbox, None, None
-            # Sandbox.terminate() is one-shot: it drops its lifecycle client
-            # before the delete call, so a retry on the same handle does nothing.
-            sandbox.terminate()
-        elif self._sandbox_id is not None:
-            from tensorlake.sandbox import Sandbox, SandboxNotFoundError
+        if self._sandbox is None and self._sandbox_id is None:
+            return
+        from tensorlake.sandbox import SandboxClient, SandboxNotFoundError
 
-            try:
-                Sandbox.connect(self._sandbox_id, api_key=self._api_key).terminate()
-            except SandboxNotFoundError:
-                pass
+        try:
+            if self._sandbox is not None:
+                sandbox, self._sandbox, self._pid = self._sandbox, None, None
+                # Sandbox.terminate() is one-shot: it drops its lifecycle client
+                # before the delete call, so a retry on the same handle does
+                # nothing.
+                sandbox.terminate()
+            else:
+                # Do not use Sandbox.connect(): it raises SandboxNotRoutableError
+                # for a sandbox that is not running, for example one that is
+                # still terminating. SandboxClient is deprecated, but it is the
+                # only public API that deletes a sandbox by ID.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    client = SandboxClient(api_key=self._api_key)
+                client.delete(self._sandbox_id)
+        except SandboxNotFoundError:
+            pass
         self._sandbox_id = None
+        self._secret_values = []
 
     def close(self) -> None:
         """Terminate the active sandbox. Also called on context-manager exit."""
