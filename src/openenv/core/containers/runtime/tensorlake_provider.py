@@ -1,0 +1,228 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""
+Tensorlake container provider for running OpenEnv environments in Tensorlake sandboxes.
+
+Requires the ``tensorlake`` SDK: ``pip install openenv[tensorlake]``
+"""
+
+from __future__ import annotations
+
+import os
+import shlex
+import time
+from typing import Any, Dict, Optional
+
+from ._server_config import parse_openenv_app_field
+from .providers import ContainerProvider
+
+_PORT = 8000
+_OPENENV_YAML = "/app/env/openenv.yaml"
+
+
+class TensorlakeProvider(ContainerProvider):
+    """
+    Container provider that runs environments in Tensorlake sandboxes.
+
+    The sandbox boots from a registered Tensorlake sandbox image. Register one
+    from a registry image with `tl sbx image import <ref>`, or from a
+    Dockerfile with `tl sbx image create <path>`. The provider then starts the
+    server on port 8000 and exposes that port on a public HTTPS URL.
+
+    Examples:
+
+    ```python
+    provider = TensorlakeProvider(image="echo-env")
+    base_url = provider.start_container()
+    provider.wait_for_ready(base_url)
+    provider.stop_container()
+    ```
+    """
+
+    def __init__(
+        self,
+        *,
+        image: Optional[str] = None,
+        env_vars: Optional[Dict[str, str]] = None,
+        api_key: Optional[str] = None,
+        cpus: Optional[float] = None,
+        memory_mb: Optional[int] = None,
+        timeout_secs: Optional[int] = None,
+        cmd: Optional[str] = None,
+    ):
+        """
+        Args:
+            image (`str`, *optional*):
+                Registered Tensorlake sandbox image name to use when
+                `start_container()` is called without an image.
+            env_vars (`dict`, *optional*):
+                Environment variables for the server process when
+                `start_container()` is called without `env_vars`.
+            api_key (`str`, *optional*):
+                Tensorlake API key. Falls back to the `TENSORLAKE_API_KEY`
+                environment variable.
+            cpus (`float`, *optional*):
+                CPUs for the sandbox. If `None`, Tensorlake chooses.
+            memory_mb (`int`, *optional*):
+                Memory for the sandbox in MB. If `None`, Tensorlake chooses.
+            timeout_secs (`int`, *optional*):
+                Sandbox lifetime in seconds. If `None`, Tensorlake chooses.
+            cmd (`str`, *optional*):
+                Shell command that starts the server on port 8000. If `None`,
+                the command is built from the `app` field of
+                `/app/env/openenv.yaml` inside the sandbox.
+        """
+        self._image = image
+        self._env_vars = env_vars
+        self._api_key = api_key or os.environ.get("TENSORLAKE_API_KEY")
+        self._cpus = cpus
+        self._memory_mb = memory_mb
+        self._timeout_secs = timeout_secs
+        self._cmd = cmd
+        self._sandbox: Any = None
+        self._pid: Optional[int] = None
+
+    def start_container(
+        self,
+        image: Optional[str] = None,
+        port: Optional[int] = None,
+        env_vars: Optional[Dict[str, str]] = None,
+        **kwargs: Any,
+    ) -> str:
+        """
+        Create a Tensorlake sandbox, start the server, and expose port 8000.
+
+        Args:
+            image (`str`, *optional*):
+                Registered Tensorlake sandbox image name. May be omitted when
+                given to the constructor.
+            port (`int`, *optional*):
+                Must be `None` or `8000`.
+            env_vars (`dict`, *optional*):
+                Environment variables for the server process.
+            **kwargs:
+                `cmd` (`str`) overrides the server command.
+
+        Returns:
+            `str`: Public HTTPS URL of port 8000 in the sandbox.
+        """
+        if port is not None and port != _PORT:
+            raise ValueError(
+                f"TensorlakeProvider only supports port {_PORT} (got {port})."
+            )
+        effective_image = image if image is not None else self._image
+        if effective_image is None:
+            raise ValueError(
+                "TensorlakeProvider requires an image. Pass it to the constructor "
+                "or start_container()."
+            )
+        effective_env_vars = self._env_vars if env_vars is None else env_vars
+        cmd = kwargs.pop("cmd", None) or self._cmd
+        # AutoEnv always forwards wait_timeout; it does not apply here.
+        kwargs.pop("wait_timeout", None)
+        if kwargs:
+            raise ValueError(
+                f"Unsupported TensorlakeProvider options: {', '.join(sorted(kwargs))}"
+            )
+
+        try:
+            from tensorlake.sandbox import Sandbox, sandbox_url_from_ingress_endpoint
+        except ImportError as exc:
+            raise ImportError(
+                "TensorlakeProvider requires the tensorlake SDK. "
+                "Install it with: pip install openenv[tensorlake]"
+            ) from exc
+
+        self._sandbox = Sandbox.create(
+            image=effective_image,
+            cpus=self._cpus,
+            memory_mb=self._memory_mb,
+            timeout_secs=self._timeout_secs,
+            api_key=self._api_key,
+        )
+        try:
+            if cmd is None:
+                cmd = self._discover_server_cmd()
+            process = self._sandbox.start_process(
+                "sh", ["-c", cmd], env=effective_env_vars or None
+            )
+            self._pid = process.pid
+
+            info = self._sandbox.update(
+                allow_unauthenticated_access=True, exposed_ports=[_PORT]
+            )
+            if not info.ingress_endpoint:
+                raise RuntimeError("Tensorlake did not return an ingress endpoint.")
+            return sandbox_url_from_ingress_endpoint(
+                info.ingress_endpoint, info.sandbox_id, _PORT
+            )
+        except Exception:
+            self.stop_container()
+            raise
+
+    def _discover_server_cmd(self) -> str:
+        """Build the server command from `openenv.yaml` inside the sandbox."""
+        try:
+            content = self._sandbox.read_file(_OPENENV_YAML).value.decode()
+        except Exception as exc:
+            raise ValueError(
+                f"Could not read {_OPENENV_YAML} in the sandbox. "
+                "Pass cmd= to TensorlakeProvider or start_container()."
+            ) from exc
+        app = parse_openenv_app_field(content)
+        if app is None:
+            raise ValueError(
+                f"{_OPENENV_YAML} has no 'app' field. "
+                "Pass cmd= to TensorlakeProvider or start_container()."
+            )
+        return (
+            f"cd /app/env && python -m uvicorn {shlex.quote(app)} "
+            f"--host 0.0.0.0 --port {_PORT}"
+        )
+
+    def stop_container(self) -> None:
+        """Terminate the Tensorlake sandbox."""
+        if self._sandbox is None:
+            return
+        try:
+            self._sandbox.terminate()
+        finally:
+            self._sandbox = None
+            self._pid = None
+
+    def wait_for_ready(self, base_url: str, timeout_s: float = 120.0) -> None:
+        """
+        Poll the `/health` endpoint until the server is ready.
+
+        Args:
+            base_url (`str`):
+                URL returned by `start_container()`.
+            timeout_s (`float`, *optional*, defaults to `120.0`):
+                Maximum time to wait in seconds.
+
+        Raises:
+            TimeoutError: If the server does not become ready in time.
+            RuntimeError: If the server process exits.
+        """
+        import requests
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                if requests.get(f"{base_url}/health", timeout=5.0).status_code == 200:
+                    return
+            except requests.RequestException:
+                pass
+
+            if self._sandbox is not None and self._pid is not None:
+                process = self._sandbox.get_process(self._pid)
+                if process.status != "running":
+                    output = self._sandbox.get_output(self._pid).lines
+                    log = "\n".join(output[-50:])
+                    raise RuntimeError(f"Server process exited.\nLog:\n{log}")
+
+            time.sleep(1.0)
+
+        raise TimeoutError(
+            f"Tensorlake sandbox at {base_url} did not become ready within {timeout_s}s"
+        )

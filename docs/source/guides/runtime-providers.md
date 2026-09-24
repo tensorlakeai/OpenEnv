@@ -16,6 +16,7 @@ is a one-line change.
 | `ACASandboxProvider` | Azure Container Apps Sandboxes | `pip install openenv[aca]` | ✅ |
 | `ModalProvider` | Modal sandboxes | `pip install openenv[modal]` | ✅ |
 | `NovitaSandboxProvider` | Novita AI sandboxes | `pip install openenv[novita]` | ✅ |
+| `TensorlakeProvider` | Tensorlake sandboxes | `pip install openenv[tensorlake]` | ✅ |
 | `KubernetesProvider` | Kubernetes cluster | core | 🚧 planned |
 
 Cloud-provider SDKs are optional extras, imported lazily, so installing core
@@ -229,6 +230,32 @@ start command is a keepalive rather than the image's `CMD`, which leaves port
 8000 free for the server the provider launches itself. That launch writes a PID
 file, so `wait_for_ready` can report a crashed server immediately instead of
 waiting out the full timeout.
+
+### TensorlakeProvider
+
+Runs the server in a Tensorlake sandbox. Install with
+`pip install openenv[tensorlake]`. Requires the `TENSORLAKE_API_KEY`
+environment variable.
+
+The sandbox boots from a registered Tensorlake sandbox image. Register one from
+a registry image with the `tl` CLI:
+
+```bash
+tl sbx image import ghcr.io/org/echo-env:latest --registered-name echo-env
+```
+
+```python
+from openenv.core.containers.runtime.tensorlake_provider import TensorlakeProvider
+
+provider = TensorlakeProvider(image="echo-env")
+```
+
+The provider starts the server from the `app` field of
+`/app/env/openenv.yaml` (pass `cmd=` to override) and exposes port 8000 on a
+**public** HTTPS URL. Anyone with the URL can reach the server while the
+sandbox runs.
+
+Full example: [`examples/tensorlake_echo_env.py`](https://github.com/huggingface/OpenEnv/blob/main/examples/tensorlake_echo_env.py).
 
 ### UVProvider
 
