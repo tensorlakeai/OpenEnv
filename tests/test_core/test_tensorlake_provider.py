@@ -113,18 +113,39 @@ def test_stop_container_terminates_once(fake_sdk):
     sandbox.terminate.assert_called_once()
 
 
-def test_wait_for_ready_reports_dead_server(fake_sdk):
+def test_second_start_is_rejected(fake_sdk):
+    provider = TensorlakeProvider(image="echo-env")
+    provider.start_container()
+
+    with pytest.raises(RuntimeError, match="already active"):
+        provider.start_container()
+
+    fake_sdk.create.assert_called_once()
+
+
+def test_context_manager_exit_terminates_sandbox(fake_sdk):
+    with TensorlakeProvider(image="echo-env") as provider:
+        provider.start_container()
+
+    fake_sdk.create.return_value.terminate.assert_called_once()
+
+
+@pytest.mark.parametrize("surface", [False, True])
+def test_wait_for_ready_reports_dead_server(fake_sdk, surface):
     import requests
 
-    provider = TensorlakeProvider(image="echo-env")
-    url = provider.start_container()
+    provider = TensorlakeProvider(image="echo-env", surface_server_logs=surface)
+    url = provider.start_container(env_vars={"TOKEN": "s3cret"})
     sandbox = fake_sdk.create.return_value
     sandbox.get_process.return_value.status = "exited"
-    sandbox.get_output.return_value.lines = ["ModuleNotFoundError: server"]
+    sandbox.get_output.return_value.lines = ["token=s3cret", "ModuleNotFoundError"]
 
     with patch("requests.get", side_effect=requests.ConnectionError):
-        with pytest.raises(RuntimeError, match="ModuleNotFoundError"):
+        with pytest.raises(RuntimeError, match="exited") as exc:
             provider.wait_for_ready(url, timeout_s=5)
+
+    assert "s3cret" not in str(exc.value)
+    assert ("ModuleNotFoundError" in str(exc.value)) is surface
 
 
 def test_wait_for_ready_returns_on_healthy(fake_sdk):

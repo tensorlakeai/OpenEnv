@@ -49,6 +49,7 @@ class TensorlakeProvider(ContainerProvider):
         memory_mb: Optional[int] = None,
         timeout_secs: Optional[int] = None,
         cmd: Optional[str] = None,
+        surface_server_logs: bool = False,
     ):
         """
         Args:
@@ -71,6 +72,11 @@ class TensorlakeProvider(ContainerProvider):
                 Shell command that starts the server on port 8000. If `None`,
                 the command is built from the `app` field of
                 `/app/env/openenv.yaml` inside the sandbox.
+            surface_server_logs (`bool`, *optional*, defaults to `False`):
+                If `True`, include the last 50 lines of server output in the
+                error when the server exits. Values of `env_vars` are replaced
+                with `***` (best-effort). If `False`, output is withheld so
+                that secrets do not leak into logs.
         """
         self._image = image
         self._env_vars = env_vars
@@ -79,6 +85,8 @@ class TensorlakeProvider(ContainerProvider):
         self._memory_mb = memory_mb
         self._timeout_secs = timeout_secs
         self._cmd = cmd
+        self._surface_server_logs = surface_server_logs
+        self._secret_values: list[str] = []
         self._sandbox: Any = None
         self._pid: Optional[int] = None
 
@@ -105,7 +113,14 @@ class TensorlakeProvider(ContainerProvider):
 
         Returns:
             `str`: Public HTTPS URL of port 8000 in the sandbox.
+
+        Raises:
+            RuntimeError: If a sandbox from an earlier call is still active.
         """
+        if self._sandbox is not None:
+            raise RuntimeError(
+                "A Tensorlake sandbox is already active. Call stop_container() first."
+            )
         if port is not None and port != _PORT:
             raise ValueError(
                 f"TensorlakeProvider only supports port {_PORT} (got {port})."
@@ -133,6 +148,7 @@ class TensorlakeProvider(ContainerProvider):
                 "Install it with: pip install openenv[tensorlake]"
             ) from exc
 
+        self._secret_values = [v for v in (effective_env_vars or {}).values() if v]
         self._sandbox = Sandbox.create(
             image=effective_image,
             cpus=self._cpus,
@@ -180,6 +196,18 @@ class TensorlakeProvider(ContainerProvider):
             f"--host 0.0.0.0 --port {_PORT}"
         )
 
+    def _server_exited_message(self) -> str:
+        """Build the error for a dead server. Output is withheld by default."""
+        if not self._surface_server_logs:
+            return (
+                "Server process exited. Output is withheld to avoid leaking "
+                "secrets. Pass surface_server_logs=True to include it."
+            )
+        log = "\n".join(self._sandbox.get_output(self._pid).lines[-50:])
+        for value in self._secret_values:
+            log = log.replace(value, "***")
+        return f"Server process exited.\nLog (redacted, best-effort):\n{log}"
+
     def stop_container(self) -> None:
         """Terminate the Tensorlake sandbox."""
         if self._sandbox is None:
@@ -189,6 +217,10 @@ class TensorlakeProvider(ContainerProvider):
         finally:
             self._sandbox = None
             self._pid = None
+
+    def close(self) -> None:
+        """Terminate the active sandbox. Also called on context-manager exit."""
+        self.stop_container()
 
     def wait_for_ready(self, base_url: str, timeout_s: float = 120.0) -> None:
         """
@@ -217,9 +249,7 @@ class TensorlakeProvider(ContainerProvider):
             if self._sandbox is not None and self._pid is not None:
                 process = self._sandbox.get_process(self._pid)
                 if process.status != "running":
-                    output = self._sandbox.get_output(self._pid).lines
-                    log = "\n".join(output[-50:])
-                    raise RuntimeError(f"Server process exited.\nLog:\n{log}")
+                    raise RuntimeError(self._server_exited_message())
 
             time.sleep(1.0)
 
