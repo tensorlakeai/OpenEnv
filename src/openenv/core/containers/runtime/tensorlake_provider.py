@@ -8,6 +8,7 @@ Requires the ``tensorlake`` SDK: ``pip install openenv[tensorlake]``
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import time
@@ -15,6 +16,8 @@ from typing import Any, Dict, Optional
 
 from ._server_config import parse_openenv_app_field
 from .providers import ContainerProvider
+
+logger = logging.getLogger(__name__)
 
 _PORT = 8000
 _OPENENV_YAML = "/app/env/openenv.yaml"
@@ -88,6 +91,7 @@ class TensorlakeProvider(ContainerProvider):
         self._surface_server_logs = surface_server_logs
         self._secret_values: list[str] = []
         self._sandbox: Any = None
+        self._sandbox_id: Optional[str] = None
         self._pid: Optional[int] = None
 
     def start_container(
@@ -117,7 +121,7 @@ class TensorlakeProvider(ContainerProvider):
         Raises:
             RuntimeError: If a sandbox from an earlier call is still active.
         """
-        if self._sandbox is not None:
+        if self._sandbox is not None or self._sandbox_id is not None:
             raise RuntimeError(
                 "A Tensorlake sandbox is already active. Call stop_container() first."
             )
@@ -157,6 +161,7 @@ class TensorlakeProvider(ContainerProvider):
             api_key=self._api_key,
         )
         try:
+            self._sandbox_id = self._sandbox.sandbox_id
             if cmd is None:
                 cmd = self._discover_server_cmd()
             process = self._sandbox.start_process(
@@ -173,7 +178,15 @@ class TensorlakeProvider(ContainerProvider):
                 info.ingress_endpoint, info.sandbox_id, _PORT
             )
         except Exception:
-            self.stop_container()
+            # Do not let a cleanup failure hide the original error.
+            try:
+                self.stop_container()
+            except Exception:
+                logger.warning(
+                    "Could not terminate Tensorlake sandbox %s after a failed start.",
+                    self._sandbox_id,
+                    exc_info=True,
+                )
             raise
 
     def _discover_server_cmd(self) -> str:
@@ -209,12 +222,25 @@ class TensorlakeProvider(ContainerProvider):
         return f"Server process exited.\nLog (redacted, best-effort):\n{log}"
 
     def stop_container(self) -> None:
-        """Terminate the Tensorlake sandbox. On failure, keep the handle for a retry."""
-        if self._sandbox is None:
-            return
-        self._sandbox.terminate()
-        self._sandbox = None
-        self._pid = None
+        """
+        Terminate the Tensorlake sandbox.
+
+        If termination fails, the sandbox ID is kept. The next call connects
+        to the sandbox again by ID and tries again.
+        """
+        if self._sandbox is not None:
+            sandbox, self._sandbox, self._pid = self._sandbox, None, None
+            # Sandbox.terminate() is one-shot: it drops its lifecycle client
+            # before the delete call, so a retry on the same handle does nothing.
+            sandbox.terminate()
+        elif self._sandbox_id is not None:
+            from tensorlake.sandbox import Sandbox, SandboxNotFoundError
+
+            try:
+                Sandbox.connect(self._sandbox_id, api_key=self._api_key).terminate()
+            except SandboxNotFoundError:
+                pass
+        self._sandbox_id = None
 
     def close(self) -> None:
         """Terminate the active sandbox. Also called on context-manager exit."""
@@ -245,8 +271,14 @@ class TensorlakeProvider(ContainerProvider):
                 pass
 
             if self._sandbox is not None and self._pid is not None:
-                process = self._sandbox.get_process(self._pid)
-                if process.status != "running":
+                from tensorlake.sandbox import SandboxError
+
+                try:
+                    status = self._sandbox.get_process(self._pid).status
+                except SandboxError:
+                    # Temporary SDK or proxy errors are common during a cold start.
+                    status = "running"
+                if status != "running":
                     raise RuntimeError(self._server_exited_message())
 
             time.sleep(1.0)
