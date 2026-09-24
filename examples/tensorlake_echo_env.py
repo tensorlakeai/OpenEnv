@@ -44,7 +44,7 @@ async def main() -> int:
     base_url = await asyncio.to_thread(provider.start_container)
     try:
         await asyncio.to_thread(provider.wait_for_ready, base_url, 300)
-        logger.info("Server ready at %s", base_url)
+        logger.info("Server ready")
 
         async with EchoEnv(base_url=base_url) as env:
             await env.reset()

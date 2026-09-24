@@ -113,6 +113,19 @@ def test_stop_container_terminates_once(fake_sdk):
     sandbox.terminate.assert_called_once()
 
 
+def test_failed_stop_can_be_retried(fake_sdk):
+    provider = TensorlakeProvider(image="echo-env")
+    provider.start_container()
+    sandbox = fake_sdk.create.return_value
+    sandbox.terminate.side_effect = [ConnectionError("network"), None]
+
+    with pytest.raises(ConnectionError):
+        provider.stop_container()
+    provider.stop_container()
+
+    assert sandbox.terminate.call_count == 2
+
+
 def test_second_start_is_rejected(fake_sdk):
     provider = TensorlakeProvider(image="echo-env")
     provider.start_container()

@@ -209,14 +209,12 @@ class TensorlakeProvider(ContainerProvider):
         return f"Server process exited.\nLog (redacted, best-effort):\n{log}"
 
     def stop_container(self) -> None:
-        """Terminate the Tensorlake sandbox."""
+        """Terminate the Tensorlake sandbox. On failure, keep the handle for a retry."""
         if self._sandbox is None:
             return
-        try:
-            self._sandbox.terminate()
-        finally:
-            self._sandbox = None
-            self._pid = None
+        self._sandbox.terminate()
+        self._sandbox = None
+        self._pid = None
 
     def close(self) -> None:
         """Terminate the active sandbox. Also called on context-manager exit."""
@@ -254,5 +252,5 @@ class TensorlakeProvider(ContainerProvider):
             time.sleep(1.0)
 
         raise TimeoutError(
-            f"Tensorlake sandbox at {base_url} did not become ready within {timeout_s}s"
+            f"Tensorlake sandbox did not become ready within {timeout_s}s"
         )
