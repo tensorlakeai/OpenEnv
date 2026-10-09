@@ -14,6 +14,7 @@ sandbox backend is responsible for writing files and running commands.
 from __future__ import annotations
 
 import json
+import shlex
 
 from .config import PiConfig
 
@@ -108,9 +109,10 @@ def build_models_json(config: PiConfig) -> str:
 def build_install_cmd(config: PiConfig) -> str:
     """Return the shell command that installs Pi (bootstrapping Node if needed)."""
     home = config.sandbox_home
-    package = _PI_NPM_PACKAGE
-    if config.pi_version and config.pi_version != "latest":
-        package = f"{package}@{config.pi_version}"
+    version = config.pi_version if config.pi_version and config.pi_version != "latest" else "0.73.1"
+    package = shlex.quote(f"{_PI_NPM_PACKAGE}@{version}")
+    prefix = npm_prefix(config)
+    tools = f"{prefix}/lib/tensorlake-tools"
     return (
         "set -e && "
         f"mkdir -p {home}/.pi/agent {home}/logs/agent {home}/logs/verifier {home}/task {home}/workdir && "
@@ -122,7 +124,11 @@ def build_install_cmd(config: PiConfig) -> str:
         f"curl -fsSL https://nodejs.org/dist/v{_NODE_VERSION}/node-v{_NODE_VERSION}-linux-$A.tar.xz "
         f"| tar -xJ -C {home} && ln -sfn {home}/node-v{_NODE_VERSION}-linux-$A {node_dir(config)}; fi && "
         f'export PATH="{node_dir(config)}/bin:$PATH" && '
-        f"npm install -g --prefix {npm_prefix(config)} {package} && "
+        f"npm install --global --prefix {prefix} --ignore-scripts pnpm@11.28.5 && "
+        f"mkdir -p {tools} {prefix}/bin && "
+        f"{prefix}/bin/pnpm --dir {tools} --config.minimumReleaseAge=1440 --config.minimumReleaseAgeStrict=true --config.minimumReleaseAgeIgnoreMissingTime=false --config.trustLockfile=false --config.blockExoticSubdeps=true --config.strictDepBuilds=true --config.optimisticRepeatInstall=false "
+        f"add --ignore-scripts --save-exact {package} && "
+        f"ln -sfn {tools}/node_modules/.bin/pi {pi_bin_path(config)} && "
         f"{pi_bin_path(config)} --version"
     )
 

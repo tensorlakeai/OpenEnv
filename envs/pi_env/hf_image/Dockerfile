@@ -25,7 +25,10 @@ ENV PATH="/root/.node/bin:/root/.pi-npm/bin:${PATH}"
 RUN A=$(uname -m); case $A in x86_64) A=x64;; aarch64|arm64) A=arm64;; esac \
     && curl -fsSL "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-$A.tar.xz" | tar -xJ -C /root \
     && ln -sfn "/root/node-v22.19.0-linux-$A" /root/.node \
-    && /root/.node/bin/npm install -g --prefix /root/.pi-npm @mariozechner/pi-coding-agent \
+    && /root/.node/bin/npm install --global --prefix /root/.pi-npm --ignore-scripts pnpm@11.28.5 \
+    && mkdir -p /root/.pi-npm/lib/tensorlake-tools \
+    && /root/.pi-npm/bin/pnpm --dir /root/.pi-npm/lib/tensorlake-tools --config.minimumReleaseAge=1440 --config.minimumReleaseAgeStrict=true --config.minimumReleaseAgeIgnoreMissingTime=false --config.trustLockfile=false --config.blockExoticSubdeps=true --config.strictDepBuilds=true --config.optimisticRepeatInstall=false add --ignore-scripts --save-exact @mariozechner/pi-coding-agent@0.73.1 \
+    && ln -sfn /root/.pi-npm/lib/tensorlake-tools/node_modules/.bin/pi /root/.pi-npm/bin/pi \
     && /root/.pi-npm/bin/pi --version
 
 # Directory layout the harness expects.

@@ -46,7 +46,9 @@ def test_install_cmd_bootstraps_node_and_installs_pi():
     cmd = rt.build_install_cmd(_cfg(sandbox_home="/root"))
     assert "command -v node" in cmd  # bootstrap guard
     assert "nodejs.org/dist/v22.19.0" in cmd
-    assert "npm install -g --prefix /root/.pi-npm @mariozechner/pi-coding-agent" in cmd
+    assert "add --ignore-scripts --save-exact @mariozechner/pi-coding-agent@0.73.1" in cmd
+    assert "--config.minimumReleaseAgeStrict=true" in cmd
+    assert "--config.minimumReleaseAge=1440" in cmd
     assert cmd.strip().endswith("/root/.pi-npm/bin/pi --version")
 
 
